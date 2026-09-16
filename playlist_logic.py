@@ -59,24 +59,34 @@ def normalize_song(raw: Song) -> Song:
 
 def classify_song(song: Song, profile: Dict[str, object]) -> str:
     """Return a mood label given a song and user profile."""
-    energy = song.get("energy", 0)
-    genre = song.get("genre", "")
-    title = song.get("title", "")
+    energy = int(song.get("energy", 0))
+    genre = str(song.get("genre", "")).lower().strip()
+    title = str(song.get("title", "")).lower().strip()
+    tags = [str(t).lower().strip() for t in song.get("tags", [])]
 
-    hype_min_energy = profile.get("hype_min_energy", 7)
-    chill_max_energy = profile.get("chill_max_energy", 3)
-    favorite_genre = profile.get("favorite_genre", "")
+    hype_min_energy = int(profile.get("hype_min_energy", 7))
+    chill_max_energy = int(profile.get("chill_max_energy", 3))
+    favorite_genre = str(profile.get("favorite_genre", "")).lower().strip()
 
     hype_keywords = ["rock", "punk", "party"]
     chill_keywords = ["lofi", "ambient", "sleep"]
 
-    is_hype_keyword = any(k in genre for k in hype_keywords)
-    is_chill_keyword = any(k in title for k in chill_keywords)
+    # Search keywords case-insensitively across genre, tags, and title
+    combined_info = f"{genre} {' '.join(tags)} {title}"
+    is_hype_keyword = any(k in combined_info for k in hype_keywords)
+    is_chill_keyword = any(k in combined_info for k in chill_keywords)
 
-    if genre == favorite_genre or energy >= hype_min_energy or is_hype_keyword:
+    # Fix (Issue #1 - Song Mislabeling in Classification):
+    # Prevent quiet/low-energy songs from being mislabeled as "Hype".
+    # 1. High energy (>= hype_min_energy) -> Hype.
+    # 2. Low energy (<= chill_max_energy) or chill keywords -> Chill.
+    # 3. Mid-energy songs matching favorite_genre or hype keywords lean Hype, otherwise Mixed.
+    if energy >= hype_min_energy:
         return "Hype"
-    if energy <= chill_max_energy or is_chill_keyword:
+    if energy <= chill_max_energy or (is_chill_keyword and not is_hype_keyword):
         return "Chill"
+    if genre == favorite_genre or is_hype_keyword:
+        return "Hype"
     return "Mixed"
 
 
@@ -101,7 +111,9 @@ def merge_playlists(a: PlaylistMap, b: PlaylistMap) -> PlaylistMap:
     """Merge two playlist maps into a new map."""
     merged: PlaylistMap = {}
     for key in set(list(a.keys()) + list(b.keys())):
-        merged[key] = a.get(key, [])
+        # Fix (Issue #2 - In-place Input Mutation During Merge):
+        # Create a shallow copy list(a.get(...)) to avoid mutating input playlist 'a' in-place.
+        merged[key] = list(a.get(key, []))
         merged[key].extend(b.get(key, []))
     return merged
 
@@ -116,12 +128,17 @@ def compute_playlist_stats(playlists: PlaylistMap) -> Dict[str, object]:
     chill = playlists.get("Chill", [])
     mixed = playlists.get("Mixed", [])
 
-    total = len(hype)
+    # Fix (Issue #3 - Erroneous Statistics Calculations):
+    # Calculate hype_ratio against len(all_songs) rather than len(hype),
+    # which previously caused hype_ratio to always evaluate to 1.0 (100%).
+    total = len(all_songs)
     hype_ratio = len(hype) / total if total > 0 else 0.0
 
+    # Fix (Issue #3 - Erroneous Statistics Calculations):
+    # Sum energy across all_songs rather than just hype, preventing deflated average energy.
     avg_energy = 0.0
     if all_songs:
-        total_energy = sum(song.get("energy", 0) for song in hype)
+        total_energy = sum(int(song.get("energy", 0)) for song in all_songs)
         avg_energy = total_energy / len(all_songs)
 
     top_artist, top_count = most_common_artist(all_songs)
@@ -164,11 +181,18 @@ def search_songs(
         return songs
 
     q = query.lower().strip()
+    if not q:
+        return songs
+
     filtered: List[Song] = []
 
     for song in songs:
-        value = str(song.get(field, "")).lower()
-        if value and value in q:
+        val = song.get(field, "")
+        # Fix (Issue #4 - Inverted Substring Match & List Field Support in Search):
+        # Check if query substring is contained in the song's field value (q in str(item).lower()),
+        # rather than inverted (value in q). Also handles both scalar values and lists (e.g. tags).
+        raw_values = val if isinstance(val, list) else [val]
+        if any(q in str(item).lower() for item in raw_values if item is not None):
             filtered.append(song)
 
     return filtered
@@ -184,7 +208,9 @@ def lucky_pick(
     elif mode == "chill":
         songs = playlists.get("Chill", [])
     else:
-        songs = playlists.get("Hype", []) + playlists.get("Chill", [])
+        # Fix (Issue #5 - Lucky Pick "Any" Mode Excluded Mixed Songs):
+        # Include all playlists (Hype, Chill, Mixed) when mode is "any".
+        songs = playlists.get("Hype", []) + playlists.get("Chill", []) + playlists.get("Mixed", [])
 
     return random_choice_or_none(songs)
 
@@ -193,6 +219,10 @@ def random_choice_or_none(songs: List[Song]) -> Optional[Song]:
     """Return a random song or None."""
     import random
 
+    # Fix (Issue #6 - Empty Playlist Crash in Lucky Pick):
+    # Return None on empty list instead of raising IndexError.
+    if not songs:
+        return None
     return random.choice(songs)
 
 
